@@ -68,11 +68,18 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://redis:6379/0")
 
     # ── Scraper ───────────────────────────────────────────────────────────────
-    poll_interval_seconds: int = Field(default=30)
+    # CHANGED: reduced from 30 → 20 seconds for near-real-time monitoring
+    poll_interval_seconds: int = Field(default=20)
     page_load_timeout: int = Field(default=60_000)  # ms
     element_timeout: int = Field(default=30_000)    # ms
     max_retries: int = Field(default=5)
     retry_backoff_base: float = Field(default=5.0)
+
+    # ── Listing-page fetch strategy ───────────────────────────────────────────
+    # use_httpx_for_listing: True = fast httpx GET for the listing page (default)
+    #                         False = Playwright (needed if site is fully JS-rendered
+    #                         and httpx returns an empty article list)
+    use_httpx_for_listing: bool = Field(default=True)
 
     # ── Browser ───────────────────────────────────────────────────────────────
     headless: bool = Field(default=True)
