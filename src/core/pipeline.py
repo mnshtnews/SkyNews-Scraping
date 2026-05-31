@@ -6,13 +6,18 @@ The central orchestration service.
 ArticlePipeline wires together all subsystems:
   Scraper → Classifier → Repository → Telegram
 
-It is the only place that knows about all four subsystems.
-Each subsystem knows nothing about the others.
+Change log (near-real-time update):
+  • run_forever() now sleeps only for the remaining time after processing
+    completes, so a slow poll cycle does NOT push the next poll further out.
+    Example: poll_interval=20s, cycle takes 3 s → next poll starts in 17 s.
+    Old behaviour: cycle takes 3 s → next poll starts in 23 s (30 + 3).
+  • Empty-listing-page (304 / no new articles) fast-paths skip all processing.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -82,14 +87,24 @@ class ArticlePipeline:
     async def run_forever(self) -> None:
         """
         Continuously poll all subcategories in round-robin fashion.
-        Runs until cancelled (KeyboardInterrupt / SIGTERM).
+
+        KEY FIX: we measure wall-clock time consumed by each poll cycle and
+        sleep only the *remainder* of the interval.  This means the effective
+        check frequency stays close to poll_interval_seconds regardless of how
+        long each cycle takes.
+
+        Old behaviour:  sleep(30) AFTER the cycle → 30 s + ~2 min cycle = ~2.5 min
+        New behaviour:  sleep(max(0, 20 - cycle_time)) → effectively every ~20 s
         """
+        interval = self._settings.poll_interval_seconds
         logger.info(
             f"Monitoring {len(self._settings.subcategories)} subcategories "
-            f"with {self._settings.poll_interval_seconds}s interval"
+            f"with {interval}s interval"
         )
 
         while self._running:
+            cycle_start = time.monotonic()
+
             for sub in self._settings.subcategories:
                 if not self._running:
                     break
@@ -100,8 +115,22 @@ class ArticlePipeline:
                 except Exception as exc:
                     logger.error(f"Unhandled error polling {sub['name']}: {exc}")
 
-            logger.debug(f"Poll cycle complete — sleeping {self._settings.poll_interval_seconds}s")
-            await asyncio.sleep(self._settings.poll_interval_seconds)
+            elapsed = time.monotonic() - cycle_start
+            remaining = max(0.0, interval - elapsed)
+
+            if remaining > 0:
+                logger.debug(
+                    f"Poll cycle complete in {elapsed:.1f}s — "
+                    f"sleeping {remaining:.1f}s"
+                )
+                await asyncio.sleep(remaining)
+            else:
+                logger.debug(
+                    f"Poll cycle took {elapsed:.1f}s (> {interval}s interval) — "
+                    f"starting next poll immediately"
+                )
+                # Yield control briefly so other coroutines can run
+                await asyncio.sleep(0)
 
     async def run_once(self) -> list[Article]:
         """
