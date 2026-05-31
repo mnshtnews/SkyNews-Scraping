@@ -3,15 +3,23 @@ src/core/pipeline.py
 ─────────────────────
 The central orchestration service.
 
-ArticlePipeline wires together all subsystems:
+ArticlePipeline wires together:
   Scraper → Classifier → Repository → Telegram
 
-Change log (near-real-time update):
-  • run_forever() now sleeps only for the remaining time after processing
-    completes, so a slow poll cycle does NOT push the next poll further out.
-    Example: poll_interval=20s, cycle takes 3 s → next poll starts in 17 s.
-    Old behaviour: cycle takes 3 s → next poll starts in 23 s (30 + 3).
-  • Empty-listing-page (304 / no new articles) fast-paths skip all processing.
+Startup behaviour
+─────────────────
+On start(), after seeding from the DB, the pipeline fetches the live listing
+page ONCE and marks all currently visible articles as "seen" — except the
+single most-recent one.  That one article is processed and sent to Telegram
+immediately as a live "current state" signal.
+
+After that, the normal polling loop runs every poll_interval_seconds and
+sends only articles that are genuinely NEW (published after the run started).
+
+This guarantees:
+  • No flood of old articles on restart.
+  • Exactly one "latest article" is sent on startup so the channel isn't silent.
+  • Any new article published after startup is detected within ~20 seconds.
 """
 
 from __future__ import annotations
@@ -56,7 +64,10 @@ class ArticlePipeline:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Initialise all subsystems and seed deduplication state."""
+        """
+        Initialise all subsystems, seed deduplication state, then send the
+        single latest live article as a startup signal.
+        """
         logger.info("Starting ArticlePipeline …")
 
         await self._repository.connect()
@@ -64,11 +75,28 @@ class ArticlePipeline:
         await self._telegram.start()
         await self._scraper.start()
 
+        # 1. Seed from DB — articles already in storage are never re-sent
         existing_hashes = await self._repository.get_all_hashes()
         existing_urls = await self._repository.get_all_urls()
-
         await self._cache.bulk_mark_seen(existing_hashes)
         await self._scraper.seed_seen_urls(existing_urls)
+
+        # 2. Seed from live listing — mark all visible articles as seen,
+        #    return only the latest one to be processed right now.
+        for sub in self._settings.subcategories:
+            latest_stub = await self._scraper.seed_from_live_listing(sub)
+            if latest_stub:
+                # Only process if it's not already in our DB
+                if latest_stub.url not in existing_urls:
+                    logger.info(
+                        f"Startup: processing latest article → {latest_stub.url}"
+                    )
+                    await self._process_article(latest_stub)
+                else:
+                    logger.info(
+                        "Startup: latest article already in DB — skipping send. "
+                        "Watching for new articles…"
+                    )
 
         self._running = True
         logger.info("ArticlePipeline started ✓")
@@ -86,15 +114,11 @@ class ArticlePipeline:
 
     async def run_forever(self) -> None:
         """
-        Continuously poll all subcategories in round-robin fashion.
+        Continuously poll all subcategories.
 
-        KEY FIX: we measure wall-clock time consumed by each poll cycle and
-        sleep only the *remainder* of the interval.  This means the effective
-        check frequency stays close to poll_interval_seconds regardless of how
-        long each cycle takes.
-
-        Old behaviour:  sleep(30) AFTER the cycle → 30 s + ~2 min cycle = ~2.5 min
-        New behaviour:  sleep(max(0, 20 - cycle_time)) → effectively every ~20 s
+        Uses deadline-aware sleeping: measures cycle duration and sleeps only
+        the remaining time, keeping the effective interval stable at
+        poll_interval_seconds regardless of how long each cycle takes.
         """
         interval = self._settings.poll_interval_seconds
         logger.info(
@@ -120,23 +144,18 @@ class ArticlePipeline:
 
             if remaining > 0:
                 logger.debug(
-                    f"Poll cycle complete in {elapsed:.1f}s — "
-                    f"sleeping {remaining:.1f}s"
+                    f"Poll cycle done in {elapsed:.1f}s — sleeping {remaining:.1f}s"
                 )
                 await asyncio.sleep(remaining)
             else:
                 logger.debug(
-                    f"Poll cycle took {elapsed:.1f}s (> {interval}s interval) — "
-                    f"starting next poll immediately"
+                    f"Poll cycle took {elapsed:.1f}s (>{interval}s) — "
+                    f"next poll immediate"
                 )
-                # Yield control briefly so other coroutines can run
                 await asyncio.sleep(0)
 
     async def run_once(self) -> list[Article]:
-        """
-        Run exactly one poll cycle across all subcategories.
-        Useful for testing or manual triggering via the admin API.
-        """
+        """Run exactly one poll cycle. Useful for testing / admin API."""
         all_articles: list[Article] = []
         for sub in self._settings.subcategories:
             articles = await self._poll_subcategory(sub)
