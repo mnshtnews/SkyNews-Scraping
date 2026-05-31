@@ -4,18 +4,12 @@ src/scraper/skynews_engine.py
 Scraping engine for Sky News Arabia Sport.
 https://www.skynewsarabia.com/sport
 
-Architecture (revised for near-real-time):
-  • httpx (fast, lightweight) for the listing page — no browser overhead
-  • Playwright (headless Chromium) ONLY for article detail pages that need JS
-  • ETag / Last-Modified conditional GETs: 0 bytes transferred when nothing changed
-  • Batch article detail fetching with concurrency=3
-
-Latency budget (worst case):
-  - httpx listing GET:   ~0.3–0.5 s   (was 2+ minutes with Playwright)
-  - ETag 304:            ~0.1 s        (no change path)
-  - Parse + classify:    ~0.5 s
-  - Telegram push:       ~0.5 s
-  Total worst-case:      poll_interval + ~1.5 s  (≈21.5 s at 20 s interval)
+Architecture (near-real-time):
+  • httpx for the listing page  — fast, no browser overhead
+  • Playwright ONLY for article detail pages that need JS
+  • ETag / Last-Modified conditional GETs: 0 bytes when nothing changed
+  • On first startup: seed ALL current articles as seen except the single
+    latest one, so only one "catch-up" message is sent before live monitoring
 """
 
 from __future__ import annotations
@@ -40,7 +34,6 @@ from src.scraper.skynews_parser import (
 
 SKYNEWS_BASE = "https://www.skynewsarabia.com"
 
-# Selectors that confirm the listing page has loaded content (Playwright fallback)
 _CONTENT_READY_SELECTORS = [
     "article a[href*='/sport/']",
     ".story-card",
@@ -49,7 +42,7 @@ _CONTENT_READY_SELECTORS = [
     "a[href*='/sport/']",
 ]
 
-_CONTENT_WAIT_MS = 15_000   # reduced from 30 s — fail faster, retry sooner
+_CONTENT_WAIT_MS = 15_000
 
 _HTTPX_HEADERS = {
     "User-Agent": (
@@ -67,23 +60,25 @@ class SkyNewsArabiaScraper:
     """
     Production scraper for Sky News Arabia Sport section.
 
-    Uses httpx for the listing page (fast) and Playwright only for article
-    detail pages that require JavaScript rendering.
+    Startup behaviour
+    -----------------
+    On first run, the live listing page is fetched and ALL visible articles
+    are marked as seen — except the single most-recent one.  That one article
+    is processed and sent to Telegram as a "current state" signal.  After that,
+    only genuinely new articles (published after the run started) are sent.
 
-    Usage::
-
-        async with SkyNewsArabiaScraper(settings) as scraper:
-            articles = await scraper.poll_subcategory(sub)
+    This prevents the bot from flooding the channel with old articles every
+    time the process restarts.
     """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._browser_manager = BrowserManager(settings)
         self._seen_urls: set[str] = set()
-        # ETag / Last-Modified state per URL for conditional GETs
         self._etag: dict[str, str] = {}
         self._last_modified: dict[str, str] = {}
         self._http_client: Optional[httpx.AsyncClient] = None
+        self._startup_done: bool = False   # flips to True after first listing fetch
 
     async def start(self) -> None:
         self._http_client = httpx.AsyncClient(
@@ -92,7 +87,6 @@ class SkyNewsArabiaScraper:
             follow_redirects=True,
             http2=True,
         )
-        # Browser is still needed for article detail pages
         await self._browser_manager.start()
 
     async def stop(self) -> None:
@@ -110,6 +104,48 @@ class SkyNewsArabiaScraper:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
+    async def seed_seen_urls(self, known_urls: set[str]) -> None:
+        """Seed URLs already in the DB so they are never re-processed."""
+        self._seen_urls.update(known_urls)
+        logger.info(f"Seeded {len(known_urls)} known article URLs from DB into seen set")
+
+    async def seed_from_live_listing(self, subcategory: dict) -> Optional[RawArticle]:
+        """
+        Fetch the live listing page once at startup.
+
+        Marks ALL currently visible articles as seen, EXCEPT the very first
+        (most recent) one which is returned so the pipeline can process+send it.
+
+        Returns the latest article stub, or None if the listing could not be fetched.
+        """
+        url = subcategory["url"]
+        name = subcategory["name"]
+
+        logger.info(f"Startup: fetching live listing to seed seen URLs — {name}")
+
+        html = await self._httpx_load_listing(url, force=True)
+        if not html:
+            logger.warning("Startup: could not fetch live listing — will treat first poll normally")
+            return None
+
+        stubs = parse_article_list(html, subcategory=name)
+        if not stubs:
+            logger.warning("Startup: no articles found in live listing")
+            return None
+
+        # stubs[0] = most recent article on the page (first in DOM order)
+        latest_stub = stubs[0]
+
+        # Mark everything else as seen — we don't want to send old articles
+        for stub in stubs[1:]:
+            self._seen_urls.add(stub.url)
+
+        logger.info(
+            f"Startup: seeded {len(stubs) - 1} existing articles as seen. "
+            f"Will process latest: {latest_stub.url}"
+        )
+        return latest_stub
+
     async def poll_subcategory(self, subcategory: dict) -> list[RawArticle]:
         name = subcategory["name"]
         url = subcategory["url"]
@@ -121,8 +157,12 @@ class SkyNewsArabiaScraper:
         else:
             listing_html = await self._safe_load_page(url, wait_for_content=True)
 
+        # Empty string = 304 Not Modified — nothing to do
+        if listing_html == "":
+            return []
+
         if not listing_html:
-            logger.error(f"Failed to load Sky News Arabia listing page for {name}")
+            logger.error(f"Failed to load listing page for {name}")
             return []
 
         stubs = parse_article_list(listing_html, subcategory=name)
@@ -139,34 +179,34 @@ class SkyNewsArabiaScraper:
 
         return articles
 
-    async def seed_seen_urls(self, known_urls: set[str]) -> None:
-        self._seen_urls.update(known_urls)
-        logger.info(f"Seeded {len(known_urls)} known article URLs into seen set")
+    # ── Fast httpx listing fetch ───────────────────────────────────────────────
 
-    # ── Fast httpx listing fetch (primary path) ────────────────────────────────
-
-    async def _httpx_load_listing(self, url: str) -> Optional[str]:
+    async def _httpx_load_listing(self, url: str, force: bool = False) -> Optional[str]:
         """
-        Fetch the listing page with httpx using ETag/Last-Modified conditional GETs.
-        Returns None only on hard failure (not on 304 Not Modified — returns '' instead).
+        Fetch the listing page with httpx.
+        Returns:
+          str  — HTML content (may be long)
+          ""   — 304 Not Modified (nothing changed, fast path)
+          None — hard failure
+        force=True skips conditional headers (used at startup).
         """
         assert self._http_client is not None
 
         conditional_headers: dict[str, str] = {}
-        if url in self._etag:
-            conditional_headers["If-None-Match"] = self._etag[url]
-        if url in self._last_modified:
-            conditional_headers["If-Modified-Since"] = self._last_modified[url]
+        if not force:
+            if url in self._etag:
+                conditional_headers["If-None-Match"] = self._etag[url]
+            if url in self._last_modified:
+                conditional_headers["If-Modified-Since"] = self._last_modified[url]
 
         for attempt in range(1, 4):
             try:
                 response = await self._http_client.get(url, headers=conditional_headers)
 
                 if response.status_code == 304:
-                    logger.debug(f"304 Not Modified for {url} — no new articles")
-                    return ""   # empty string signals "nothing changed"
+                    logger.debug(f"304 Not Modified — no new articles")
+                    return ""
 
-                # Store conditional GET headers for next request
                 if etag := response.headers.get("ETag"):
                     self._etag[url] = etag
                 if lm := response.headers.get("Last-Modified"):
@@ -177,28 +217,25 @@ class SkyNewsArabiaScraper:
                     return None
 
                 html = response.text
-                # Sanity-check: if the page returned almost no content
-                # (JS-rendered, bot-blocked, etc.) fall back to Playwright
                 article_links = len(re.findall(r'/sport/\d', html))
                 if article_links < 3:
                     logger.warning(
-                        f"httpx listing returned only {article_links} article links "
-                        f"— falling back to Playwright for {url}"
+                        f"httpx listing: only {article_links} article links — "
+                        f"falling back to Playwright"
                     )
                     return await self._safe_load_page(url, wait_for_content=True)
 
                 return html
 
             except httpx.RequestError as exc:
-                logger.warning(f"httpx error fetching listing (attempt {attempt}): {exc}")
+                logger.warning(f"httpx listing error (attempt {attempt}): {exc}")
                 if attempt < 3:
                     await asyncio.sleep(2 * attempt)
 
-        # All httpx attempts failed — last resort: Playwright
-        logger.warning(f"All httpx listing attempts failed — using Playwright for {url}")
+        logger.warning("All httpx listing attempts failed — trying Playwright")
         return await self._safe_load_page(url, wait_for_content=True)
 
-    # ── Playwright page loading (fallback / detail pages) ──────────────────────
+    # ── Playwright fallback ────────────────────────────────────────────────────
 
     async def _safe_load_page(
         self,
@@ -259,14 +296,12 @@ class SkyNewsArabiaScraper:
                         timeout=_CONTENT_WAIT_MS,
                         state="attached",
                     )
-                    # Reduced from 1.5 s — content is already attached
                     await asyncio.sleep(0.5)
                     break
                 except PlaywrightTimeoutError:
                     continue
         else:
-            # Minimal wait for detail pages — body content loads with domcontentloaded
-            await asyncio.sleep(0.5)  # reduced from 2 s
+            await asyncio.sleep(0.5)
 
         return await page.content()
 
@@ -286,46 +321,33 @@ class SkyNewsArabiaScraper:
 
             for stub, result in zip(batch, batch_results):
                 if isinstance(result, Exception):
-                    logger.warning(
-                        f"Failed to fetch detail for {stub.url}: {result}"
-                    )
+                    logger.warning(f"Failed to fetch detail for {stub.url}: {result}")
                     results.append(stub)
                 else:
                     results.append(result)  # type: ignore[arg-type]
 
-            # Reduced inter-batch delay: 0.5 s is enough to be polite to the server
-            # Old value was 2 s — that added 2*(N//3) seconds per cycle
             if i + batch_size < len(stubs):
                 await asyncio.sleep(0.5)
 
         return results
 
     async def _fetch_article_detail(self, stub: RawArticle) -> RawArticle:
-        # Try httpx first for article detail pages too (much faster)
         html = await self._httpx_fetch_detail(stub.url)
         if not html:
-            # Fall back to Playwright if httpx can't render the page
             html = await self._safe_load_page(stub.url, wait_for_content=False)
         if not html:
             return stub
-
         return parse_article_detail(html, stub)
 
     async def _httpx_fetch_detail(self, url: str) -> Optional[str]:
-        """
-        Try fetching an article detail page with httpx (no browser overhead).
-        Returns None if the page needs JS rendering (detected by empty content).
-        """
         assert self._http_client is not None
         try:
             response = await self._http_client.get(url)
             if response.status_code != 200:
                 return None
             html = response.text
-            # If the body has data-sna-init JSON (Sky News Arabia SPA marker),
-            # the static HTML is sufficient — no JS needed
             if 'data-sna-init' in html or len(html) > 5000:
                 return html
-            return None   # too little content — needs Playwright
+            return None
         except httpx.RequestError:
             return None
