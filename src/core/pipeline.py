@@ -82,21 +82,16 @@ class ArticlePipeline:
         await self._scraper.seed_seen_urls(existing_urls)
 
         # 2. Seed from live listing — mark all visible articles as seen,
-        #    return only the latest one to be processed right now.
+        #    ALWAYS send the latest one as a startup confirmation signal.
         for sub in self._settings.subcategories:
             latest_stub = await self._scraper.seed_from_live_listing(sub)
             if latest_stub:
-                # Only process if it's not already in our DB
-                if latest_stub.url not in existing_urls:
-                    logger.info(
-                        f"Startup: processing latest article → {latest_stub.url}"
-                    )
-                    await self._process_article(latest_stub)
-                else:
-                    logger.info(
-                        "Startup: latest article already in DB — skipping send. "
-                        "Watching for new articles…"
-                    )
+                logger.info(
+                    f"Startup: sending latest article as confirmation → {latest_stub.url}"
+                )
+                await self._send_startup_article(latest_stub)
+            else:
+                logger.info("Startup: no articles found — watching for new articles…")
 
         self._running = True
         logger.info("ArticlePipeline started ✓")
@@ -111,6 +106,42 @@ class ArticlePipeline:
         logger.info("ArticlePipeline stopped")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
+
+    async def _send_startup_article(self, raw: RawArticle) -> None:
+        """
+        Always send the latest article on startup as a confirmation signal.
+        Fetches full detail, saves to DB if not already there, and sends to Telegram.
+        If already in DB, still sends to Telegram so the operator knows the bot is live.
+        """
+        try:
+            # Try to fetch full article detail
+            full_article = await self._scraper.fetch_one_article(raw)
+
+            already_in_db = await self._repository.exists_by_hash(full_article.article_hash)
+
+            if not already_in_db:
+                # Brand new article — run full pipeline
+                await self._process_article(full_article)
+            else:
+                # Already in DB — just send to Telegram as confirmation
+                classification_result = await self._classifier.classify(full_article)
+                article = Article(
+                    **full_article.model_dump(),
+                    classification=classification_result.classification,
+                    classification_confidence=classification_result.confidence,
+                    classification_method=classification_result.method,
+                    detected_uae_entities=classification_result.uae_entities,
+                    detected_arab_entities=classification_result.arab_entities,
+                    detected_global_entities=classification_result.global_entities,
+                    status=ScrapingStatus.CLASSIFIED,
+                    scraped_at=datetime.utcnow(),
+                )
+                sent = await self._telegram.send(article)
+                logger.info(
+                    f"Startup confirmation sent ({'✓' if sent else '✗'}): {article.title[:60]}"
+                )
+        except Exception as exc:
+            logger.error(f"Startup article send failed: {exc}")
 
     async def run_forever(self) -> None:
         """
