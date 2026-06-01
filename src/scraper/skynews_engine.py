@@ -136,15 +136,21 @@ class SkyNewsArabiaScraper:
         # stubs[0] = most recent article on the page (first in DOM order)
         latest_stub = stubs[0]
 
-        # Mark everything else as seen — we don't want to send old articles
-        for stub in stubs[1:]:
+        # Mark ALL articles as seen — including the latest.
+        # The pipeline will handle sending the latest separately as a startup signal.
+        # This prevents the polling loop from ever re-processing startup articles.
+        for stub in stubs:
             self._seen_urls.add(stub.url)
 
         logger.info(
-            f"Startup: seeded {len(stubs) - 1} existing articles as seen. "
-            f"Will process latest: {latest_stub.url}"
+            f"Startup: seeded {len(stubs)} articles as seen. "
+            f"Latest: {latest_stub.url}"
         )
         return latest_stub
+
+    async def fetch_one_article(self, stub: RawArticle) -> RawArticle:
+        """Fetch full detail for a single article stub."""
+        return await self._fetch_article_detail(stub)
 
     async def poll_subcategory(self, subcategory: dict) -> list[RawArticle]:
         name = subcategory["name"]
